@@ -9,6 +9,8 @@ from models.packet import PacketTemplate
 from routers.packets import router as packets_router
 from routers.replay import router as replay_router
 from routers.logs import router as logs_router
+from routers.rewrite import router as rewrite_router
+from routers.capture import router as capture_router
 
 Base.metadata.create_all(bind=engine)
 os.makedirs(settings.PCAP_DIR, exist_ok=True)
@@ -42,6 +44,8 @@ app.add_middleware(
 app.include_router(packets_router, prefix="/api/v1")
 app.include_router(replay_router,  prefix="/api/v1")
 app.include_router(logs_router,    prefix="/api/v1")
+app.include_router(rewrite_router, prefix="/api/v1")
+app.include_router(capture_router, prefix="/api/v1")
 
 @app.get("/api/v1/health")
 def health():
