@@ -3,19 +3,21 @@
 """
 pkgen_by_suricata_rules_pilot.py
 
-- If --parsed is given, load parsed CSV. Else parse --rules.
-- Group similar rules, split easy/hard, pick ~50, generate realistic PCAPs.
-- --use-llm: GPT-5로 hard rule의 지시문(JSON) 생성.
-  - 호출 시 ./log/llm/<sid>.qna 파일로 QnA 로그 저장.
-  - OPENAI_API_KEY 없으면 경고 후 휴리스틱으로 대체.
+- (--parsed CSV) 주면 파싱 생략, 아니면 (--rules)에서 Suricata 룰 파싱
+- 룰을 그룹핑(group_id)하고 쉬움/어려움 분리 → 약 50개 샘플 생성(튜닝 가능)
+- 쉬운 룰: 내장 리얼 플로우(3-way, 서버 응답, 정상 종료 / DNS Q/R / TLS ClientHello / SYN scan)
+- 어려운 룰: --use-llm 시 GPT에 질의하여 '지시문 JSON' 수신 → 엔진 렌더
+  * 질의/응답은 ./log/llm/<sid>.qna 로 기록
+  * SDK/키/네트워크 이슈 시 휴리스틱으로 대체
+- 공격 성격별 multiplicity(소스/목적지 다중화)를 LLM 또는 휴리스틱으로 결정
+  * SYN Flood/DDOS → random public src 다수(스푸핑 가정)
+  * Scan/Sweep → 대상 /24 대역 fan-out
+- 안전상한: --cap-src(기본 256), --cap-dst(기본 64)
+- PCAP 파일명: "<sid>__<msg_slug>__SRC_<src>__DST_<dst>__<group_id>.pcap"
 
-- 공격 성격별 multiplicity:
-  - SYN Flood/DDOS: 다수 random public src (spoof 가정)
-  - Scan/Sweep: dest /24 확장
-  - caps: --cap-src(기본 256), --cap-dst(기본 64)
-
-- 파일명 형식(요청 반영):
-  <sid>__<msg_slug>__SRC_<src>__DST_<dst>__<group_id>.pcap
+예시
+  python pkgen_by_suricata_rules_pilot.py --parsed suricata_rules_parsed.csv --dst 192.0.2.10 --src 192.168.56.10 --out outputs/pcaps
+  python pkgen_by_suricata_rules_pilot.py --rules suricata.rules --dst 192.0.2.10 --use-llm --single-pcap outputs/all_50.pcap
 """
 
 import argparse, os, re, json, random, time, hashlib, logging, ipaddress
@@ -324,62 +326,17 @@ def render_easy(ctx:Dict[str,Any], tmpl:str, params:Dict[str,Any])->List:
         return flow_syn_scan(ctx, params.get("start",8000), params.get("cnt",20))
     return flow_http(ctx, "GET / HTTP/1.1\r\nHost: example.test\r\n\r\n")
 
-# -------------------- LLM (with QnA logging) --------------------
-# 교체 후
-OPENAI_AVAILABLE = bool(os.getenv("OPENAI_API_KEY"))
+# -------------------- LLM (chat.completions) --------------------
+OPENAI_API_KEY_SET = bool(os.getenv("OPENAI_API_KEY"))
 OPENAI_IMPORT_OK = True
 try:
     from openai import OpenAI
 except Exception as e:
     OPENAI_IMPORT_OK = False
-    # import 실패면 LLM은 비활성으로
-    OPENAI_AVAILABLE = False
-    logging.warning("openai SDK import 실패: %s. `pip install openai` 필요.", e)
+    logging.warning("openai SDK import 실패: %s. `pip install --upgrade openai` 필요.", e)
 
-
-INSTR_SCHEMA = {
-  "type":"object",
-  "properties":{
-    "template_id":{"type":"string"},
-    "params":{"type":"object"},
-    "multiplicity":{
-        "type":"object",
-        "properties":{
-            "src":{"type":"object","properties":{
-                "strategy":{"type":"string"},
-                "count":{"type":"integer"},
-                "spoof":{"type":"boolean"}
-            }},
-            "dst":{"type":"object","properties":{
-                "strategy":{"type":"string"},
-                "count":{"type":"integer"}
-            }}
-        }
-    },
-    "filename_hint":{"type":"string"},
-    "rationale":{"type":"string"}
-  },
-  "required":["template_id","params"]
-}
-LLM_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
-
-def build_prompt(rule_text:str, group_sig:str, base_dst:str)->str:
-    return f"""당신은 Suricata 룰 분석가입니다.
-목표: 이 룰을 트리거하는 '정밀 패킷 생성 지시문(JSON)'을 작성하세요.
-제약:
-- 실제 익스플로잇 금지. 탐지 패턴 충족 최소 콘텐츠만.
-- 리얼 플로우: TCP 3-way, 서버 응답 200, 정상 종료. TLS는 ClientHello(SNI). DNS는 Query/Response.
-- multiplicity 결정:
-  - SYN Flood/DDOS: src.strategy="random_public", count 32~256, spoof=true
-  - Port scan/sweep: dst.strategy="c_class", count 16~64 (기준 /24는 {base_dst})
-  - 일반 단건: 모두 "single"
-스키마만 준수해 JSON으로만 출력.
-[입력 룰]
-{rule_text}
-
-[그룹 시그니처]
-{group_sig}
-"""
+OPENAI_AVAILABLE = OPENAI_IMPORT_OK and OPENAI_API_KEY_SET
+LOG.info("LLM flags: OPENAI_IMPORT_OK=%s, OPENAI_API_KEY_SET=%s", OPENAI_IMPORT_OK, OPENAI_API_KEY_SET)
 
 def write_qna_log(sid: str, prompt: str, model: str, output_text: str):
     try:
@@ -397,34 +354,8 @@ def write_qna_log(sid: str, prompt: str, model: str, output_text: str):
     except Exception as e:
         LOG.warning("QnA log write failed for SID=%s: %s", sid, e)
 
-def ask_llm_for_instruction(rule_text:str, group_sig:str, base_dst:str, sid:str, use_llm:bool)->Dict[str,Any]:
-    if use_llm and not OPENAI_IMPORT_OK:
-        LOG.warning("--use-llm 지정됨, 그러나 openai SDK 미설치/불러오기 실패. `pip install openai` 후 재시도합니다.")
-    elif use_llm and not os.getenv("OPENAI_API_KEY"):
-        LOG.warning("--use-llm 지정됨, 그러나 OPENAI_API_KEY 환경변수가 비어있습니다.")
-
-    if use_llm and not OPENAI_AVAILABLE:
-        LOG.warning("--use-llm 지정됨, 그러나 OPENAI_API_KEY 없음. 휴리스틱으로 대체합니다.")
-    if use_llm and OPENAI_AVAILABLE:
-        client = OpenAI()
-        prompt = build_prompt(rule_text, group_sig, base_dst)
-        resp = client.responses.create(
-            model=LLM_MODEL,
-            input=prompt,
-            response_format={"type":"json_schema","json_schema":{"name":"PktInstr","schema":INSTR_SCHEMA,"strict":True}},
-            temperature=0.2,
-        )
-        txt = resp.output[0].content[0].text
-        # QnA 로깅
-        write_qna_log(sid, prompt, LLM_MODEL, txt)
-        try:
-            return json.loads(txt)
-        except Exception:
-            LOG.warning("LLM returned non-JSON; using fallback for SID=%s.", sid)
-
-    # Heuristic fallback (no LLM or JSON parse failed)
+def _fallback_instr(rule_text: str) -> Dict[str,Any]:
     rt = (rule_text or "").lower()
-    mult = {}
     if re.search(r'\b(ddos|syn[\s_-]*flood|flood)\b', rt):
         mult = {"src":{"strategy":"random_public","count":128,"spoof":True}, "dst":{"strategy":"single","count":1}}
     elif re.search(r'\b(scan|portscan|masscan|nmap|sweep)\b', rt):
@@ -438,6 +369,60 @@ def ask_llm_for_instruction(rule_text:str, group_sig:str, base_dst:str, sid:str,
     if "http" in rt or "host" in rt or "uri" in rt:
         return {"template_id":"http_request","params":{"method":"GET","path":"/abc","headers":{"Host":"hard.example.test"},"body":""},"multiplicity":mult,"filename_hint":"http_get"}
     return {"template_id":"http_request","params":{"method":"GET","path":"/","headers":{"Host":"hard.example.test"},"body":""},"multiplicity":mult,"filename_hint":"generic_http"}
+
+def ask_llm_for_instruction(rule_text:str, group_sig:str, base_dst:str, sid:str, use_llm:bool)->Dict[str,Any]:
+    if not use_llm or not OPENAI_AVAILABLE:
+        if use_llm and not OPENAI_IMPORT_OK:
+            LOG.warning("--use-llm 지정됨, 그러나 openai SDK 미설치/불러오기 실패.")
+        elif use_llm and not OPENAI_API_KEY_SET:
+            LOG.warning("--use-llm 지정됨, 그러나 OPENAI_API_KEY 환경변수 미설정.")
+        return _fallback_instr(rule_text)
+
+    client = OpenAI()
+    model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+    system_msg = (
+        "당신은 Suricata 룰 분석가입니다. 출력은 반드시 JSON만 반환하세요. "
+        "스키마: {template_id:str, params:obj, multiplicity:{src:{strategy,count,spoof}, dst:{strategy,count}}, "
+        "filename_hint?:str, rationale?:str}. 실제 익스플로잇 금지. 리얼 플로우 전제."
+    )
+    user_msg = f"""
+목표: 룰을 트리거하는 '정밀 패킷 생성 지시문(JSON)'만 출력.
+- multiplicity 결정:
+  - SYN Flood/DDOS: src.strategy="random_public", count 32~256, spoof=true
+  - Port scan/sweep: dst.strategy="c_class", count 16~64 (/24 기준은 {base_dst})
+  - 일반 단건: 모두 "single"
+[입력 룰]
+{rule_text}
+
+[그룹 시그니처]
+{group_sig}
+JSON만 출력하세요.
+"""
+    try:
+        resp = client.chat.completions.create(
+            model=model_name,
+            messages=[
+                {"role":"system","content":system_msg},
+                {"role":"user","content":user_msg},
+            ],
+            temperature=0.2,
+        )
+        txt = resp.choices[0].message.content or ""
+        write_qna_log(sid, system_msg + "\n\n" + user_msg, model_name, txt)
+
+        # JSON만 추출 (```json ... ``` 감싸온 경우 포함)
+        m = re.search(r"\{.*\}", txt, re.S)
+        if m:
+            return json.loads(m.group(0))
+        return json.loads(txt)
+    except Exception as e:
+        LOG.warning("LLM 호출/파싱 실패(SID=%s): %s → 휴리스틱 사용", sid, e)
+        try:
+            write_qna_log(sid, system_msg + "\n\n" + user_msg, model_name, f"[EXCEPTION] {e}")
+        except Exception:
+            pass
+        return _fallback_instr(rule_text)
 
 def render_from_instruction(ctx:Dict[str,Any], instr:Dict[str,Any])->List:
     tid = instr.get("template_id","http_request")
@@ -651,7 +636,7 @@ def main():
     ap.add_argument("--single-pcap", default=None, help="Write all flows into one PCAP (e.g., outputs/all_50.pcap)")
     ap.add_argument("--count", type=int, default=50, help="How many rules to test [default: 50]")
     ap.add_argument("--easy-count", type=int, default=30, help="How many from easy set [default: 30]")
-    ap.add_argument("--use-llm", action="store_true", help="If set, try GPT-5 for hard rules (needs OPENAI_API_KEY)")
+    ap.add_argument("--use-llm", action="store_true", help="If set, try GPT for hard rules (needs OPENAI_API_KEY)")
     ap.add_argument("--cap-src", type=int, default=256, help="Upper cap for source multiplicity [default: 256]")
     ap.add_argument("--cap-dst", type=int, default=64, help="Upper cap for destination multiplicity [default: 64]")
     args = ap.parse_args()
