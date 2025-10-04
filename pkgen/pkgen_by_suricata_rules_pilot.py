@@ -405,8 +405,7 @@ JSON만 출력하세요.
             messages=[
                 {"role":"system","content":system_msg},
                 {"role":"user","content":user_msg},
-            ],
-            temperature=0.2,
+            ]            
         )
         txt = resp.choices[0].message.content or ""
         write_qna_log(sid, system_msg + "\n\n" + user_msg, model_name, txt)
