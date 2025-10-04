@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Mix ~50 Suricata rules (easy + LLM-instruction) and generate realistic multi-packet PCAPs.
+pkgen_by_suricata_rules_pilot.py
 
-Features
-- Parse suricata.rules -> in-memory table
-- Group similar rules -> group_id
-- Difficulty split: easy vs hard
-- Sample ~50 (default easy=30, hard=20; tunable)
-- Easy: built-in realistic flows (TCP 3WH, server resp, FIN close / DNS Q/R / TLS ClientHello)
-- Hard: ask GPT-5 for instruction JSON (structured) then render (fallback when API key absent)
-- DDoS-like multi-source: --random-src N => N random *public* source IPs
-- Dest /24 expansion: --dst-cclass N => within A.B.C.0/24
-- Filenames contain group_id + SID + msg slug + endpoints
+Suricata rules -> (optional parse) -> group -> pick ~50 (easy+hard) -> generate realistic PCAPs
+Now with per-rule endpoint multiplicity decided by GPT-5 instruction or heuristic:
+- e.g., SYN Flood: many random *public* source IPs (spoofing assumption)
+- e.g., Scan: destination /24 fan-out
 
-for use OpenAI API
-export OPENAI_API_KEY="sk-여기에_당신의_API키"
-export OPENAI_MODEL="gpt-5" 
+Key points
+- If --parsed is provided, skip parsing and load CSV directly; else parse --rules.
+- Group similar rules -> group_id; difficulty split (easy vs hard).
+- Select ~50 rules (default easy=30, hard=20; tunable).
+- Easy: built-in realistic flows (TCP 3WH + resp + FIN / DNS Q/R / TLS ClientHello / SYN scan).
+- Hard: (optional) GPT-5 structured instruction JSON -> engine renders (fallback when no API key).
+- NEW: multiplicity = {"src": {...}, "dst": {...}} to control many source/dest by *rule semantics*.
+- Safety caps: --cap-src (default 256), --cap-dst (default 64).
 
-Usage examples
-  python mixed_50_rule_pcapgen.py --rules suricata.rules --dst 192.0.2.10 --src 192.168.56.10 --out outputs/pcaps --count 50
-  python mixed_50_rule_pcapgen.py --rules suricata.rules --dst 192.0.2.10 --use-llm --single-pcap outputs/all_50.pcap
-  python mixed_50_rule_pcapgen.py --rules suricata.rules --dst 203.0.113.10 --random-src 200 --dst-cclass 30 --single-pcap outputs/all_50_varied.pcap
+Usage
+  python pkgen_by_suricata_rules_pilot.py --parsed suricata_rules_parsed.csv --dst 192.0.2.10 --src 192.168.56.10 --out outputs/pcaps
+  python pkgen_by_suricata_rules_pilot.py --rules suricata.rules --dst 192.0.2.10 --use-llm --single-pcap outputs/all_50.pcap
+  python pkgen_by_suricata_rules_pilot.py --parsed suricata_rules_parsed.csv --dst 203.0.113.10 --use-llm --single-pcap outputs/all_50_varied.pcap
 """
 
 import argparse, os, re, json, random, time, hashlib, logging, ipaddress
@@ -32,7 +31,7 @@ from typing import Dict, Any, List, Tuple, Optional
 import pandas as pd
 from scapy.all import IP, TCP, UDP, Raw, DNS, DNSQR, DNSRR, wrpcap
 
-LOG = logging.getLogger("mix50")
+LOG = logging.getLogger("pkgen")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 # =========================
@@ -55,7 +54,7 @@ def stamp(pkts: List, t0: float, delta: float=0.02) -> List:
     return pkts
 
 # =========================
-# Parse suricata.rules (single file)
+# Parse suricata.rules (when --rules is used)
 # =========================
 RULE_RE = re.compile(
     r'^\s*(alert|drop|reject|pass|log)\s+[^\n]*?\([^\)]*\)\s*;?\s*$',
@@ -280,9 +279,7 @@ def build_clienthello_with_sni(hostname: str) -> bytes:
     rec=b"\x16"+ver+len(hs).to_bytes(2,'big')+hs
     return rec
 
-# =========================
-# Easy templates (engine)
-# =========================
+# Easy flows
 def flow_http(ctx:Dict[str,Any], req:str, resp:bytes=b"HTTP/1.1 200 OK\r\nContent-Length:0\r\n\r\n", dport:int=80)->List:
     src, dst = ctx["src"], ctx["dst"]
     sport=random.randint(20000,65000)
@@ -345,7 +342,7 @@ def render_easy(ctx:Dict[str,Any], tmpl:str, params:Dict[str,Any])->List:
     return flow_http(ctx, "GET / HTTP/1.1\r\nHost: example.test\r\n\r\n")
 
 # =========================
-# GPT-5 Instruction (hard rules)
+# GPT-5 Instruction (hard rules) — with multiplicity
 # =========================
 OPENAI_AVAILABLE = False
 try:
@@ -360,6 +357,20 @@ INSTR_SCHEMA = {
   "properties":{
     "template_id":{"type":"string"},
     "params":{"type":"object"},
+    "multiplicity":{
+        "type":"object",
+        "properties":{
+            "src":{"type":"object","properties":{
+                "strategy":{"type":"string"},   # "single"|"random_public"
+                "count":{"type":"integer"},
+                "spoof":{"type":"boolean"}
+            }},
+            "dst":{"type":"object","properties":{
+                "strategy":{"type":"string"},   # "single"|"c_class"
+                "count":{"type":"integer"}
+            }}
+        }
+    },
     "filename_hint":{"type":"string"},
     "rationale":{"type":"string"}
   },
@@ -368,13 +379,17 @@ INSTR_SCHEMA = {
 
 LLM_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
 
-def build_prompt(rule_text:str, group_sig:str)->str:
+def build_prompt(rule_text:str, group_sig:str, base_dst:str)->str:
     return f"""당신은 Suricata 룰 분석가입니다.
-주어진 룰을 트리거하는 '정밀 패킷 생성 지시문(JSON)'을 작성하세요.
+목표: 이 룰을 트리거하는 '정밀 패킷 생성 지시문(JSON)'을 작성하세요.
 제약:
-- 실제 익스플로잇 금지, 탐지 패턴 충족 최소 콘텐츠만.
-- 리얼 플로우 전제: TCP 3-way, 서버 응답, 정상 종료. DNS는 Query/Response.
-- template_id: http_request / dns_query / tls_clienthello / syn_scan 권장.
+- 실제 익스플로잇 금지. 탐지 패턴 충족 최소 콘텐츠만.
+- 리얼 플로우: TCP 3-way, 서버 응답 200, 정상 종료. TLS는 ClientHello(SNI). DNS는 Query/Response.
+- **multiplicity 결정 필수**: 공격 성격에 따라 소스/목적지 다중화를 기술.
+  - SYN Flood/DDOS: src.strategy="random_public", count는 32~256 범위 권장, spoof=true
+  - Port scan/sweep: dst.strategy="c_class", count는 16~64 범위 권장 (기준 /24는 {base_dst} 의 /24)
+  - 일반 단건: 둘 다 "single"
+스키마를 준수하고, 불필요한 설명은 rationale에만.
 [입력 룰]
 {rule_text}
 
@@ -382,21 +397,29 @@ def build_prompt(rule_text:str, group_sig:str)->str:
 {group_sig}
 """
 
-def ask_llm_for_instruction(rule_text:str, group_sig:str)->Dict[str,Any]:
+def ask_llm_for_instruction(rule_text:str, group_sig:str, base_dst:str)->Dict[str,Any]:
     if not OPENAI_AVAILABLE:
-        # Fallback heuristic
+        # Heuristic fallback with multiplicity
         rt = (rule_text or "").lower()
+        mult = {}
+        if re.search(r'\b(ddos|syn[\s_-]*flood|flood)\b', rt):
+            mult = {"src":{"strategy":"random_public","count":128,"spoof":True}, "dst":{"strategy":"single","count":1}}
+        elif re.search(r'\b(scan|portscan|masscan|nmap|sweep)\b', rt):
+            mult = {"src":{"strategy":"single","count":1}, "dst":{"strategy":"c_class","count":32}}
+        else:
+            mult = {"src":{"strategy":"single","count":1}, "dst":{"strategy":"single","count":1}}
         if "dns" in rt or "dns.query" in rt:
-            return {"template_id":"dns_query","params":{"qname":"hard.example.test","qtype":"A"},"filename_hint":"dns_like"}
+            return {"template_id":"dns_query","params":{"qname":"hard.example.test","qtype":"A"},"multiplicity":mult,"filename_hint":"dns_like"}
         if "tls" in rt or "tls.sni" in rt:
-            return {"template_id":"tls_clienthello","params":{"sni":"hard.example.test"},"filename_hint":"tls_sni"}
+            return {"template_id":"tls_clienthello","params":{"sni":"hard.example.test"},"multiplicity":mult,"filename_hint":"tls_sni"}
         if "http" in rt or "host" in rt or "uri" in rt:
-            return {"template_id":"http_request","params":{"method":"GET","path":"/abc","headers":{"Host":"hard.example.test"},"body":""},"filename_hint":"http_get"}
-        return {"template_id":"http_request","params":{"method":"GET","path":"/","headers":{"Host":"hard.example.test"},"body":""},"filename_hint":"generic_http"}
+            return {"template_id":"http_request","params":{"method":"GET","path":"/abc","headers":{"Host":"hard.example.test"},"body":""},"multiplicity":mult,"filename_hint":"http_get"}
+        return {"template_id":"http_request","params":{"method":"GET","path":"/","headers":{"Host":"hard.example.test"},"body":""},"multiplicity":mult,"filename_hint":"generic_http"}
+
     client = OpenAI()
     resp = client.responses.create(
         model=LLM_MODEL,
-        input=build_prompt(rule_text, group_sig),
+        input=build_prompt(rule_text, group_sig, base_dst),
         response_format={"type":"json_schema","json_schema":{"name":"PktInstr","schema":INSTR_SCHEMA,"strict":True}},
         temperature=0.2,
     )
@@ -405,7 +428,9 @@ def ask_llm_for_instruction(rule_text:str, group_sig:str)->Dict[str,Any]:
         return json.loads(txt)
     except Exception:
         LOG.warning("LLM returned non-JSON; using fallback.")
-        return {"template_id":"http_request","params":{"method":"GET","path":"/","headers":{"Host":"hard.example.test"},"body":""},"filename_hint":"generic_http"}
+        return {"template_id":"http_request","params":{"method":"GET","path":"/","headers":{"Host":"hard.example.test"},"body":""},
+                "multiplicity":{"src":{"strategy":"single","count":1},"dst":{"strategy":"single","count":1}},
+                "filename_hint":"generic_http"}
 
 def render_from_instruction(ctx:Dict[str,Any], instr:Dict[str,Any])->List:
     tid = instr.get("template_id","http_request")
@@ -435,7 +460,7 @@ def render_from_instruction(ctx:Dict[str,Any], instr:Dict[str,Any])->List:
     return flow_http(ctx, "GET / HTTP/1.1\r\nHost: hard.example.test\r\n\r\n")
 
 # =========================
-# Endpoint expansion (DDoS-like)
+# Endpoint multiplicity helpers
 # =========================
 PRIVATE_NETS = [
     ipaddress.ip_network("10.0.0.0/8"),
@@ -466,7 +491,10 @@ def random_public_ipv4() -> str:
 
 def expand_c_class(dst: str, count: int) -> List[str]:
     """A.B.C.X -> same /24 pool, include dst first, exclude .0/.255 duplicates"""
-    a,b,c,_ = [int(x) for x in dst.split(".")]
+    try:
+        a,b,c,_ = [int(x) for x in dst.split(".")]
+    except Exception:
+        return [dst]
     pool = [i for i in range(1,255)]
     random.shuffle(pool)
     out = [dst]
@@ -476,6 +504,41 @@ def expand_c_class(dst: str, count: int) -> List[str]:
         if cand != dst:
             out.append(cand)
     return out[:count]
+
+def multiplicity_from_instruction(instr: Dict[str,Any], base_src: str, base_dst: str, cap_src:int, cap_dst:int) -> Tuple[List[str], List[str]]:
+    # defaults
+    srcs = [base_src]; dsts=[base_dst]
+    mult = instr.get("multiplicity") or {}
+    s = mult.get("src") or {}
+    d = mult.get("dst") or {}
+
+    # Source
+    s_strategy = (s.get("strategy") or "single").lower()
+    s_count = int(s.get("count", 1))
+    s_count = max(1, min(s_count, cap_src))
+    if s_strategy == "random_public":
+        srcs = [random_public_ipv4() for _ in range(s_count)]
+    else:
+        srcs = [base_src]
+
+    # Dest
+    d_strategy = (d.get("strategy") or "single").lower()
+    d_count = int(d.get("count", 1))
+    d_count = max(1, min(d_count, cap_dst))
+    if d_strategy == "c_class":
+        dsts = expand_c_class(base_dst, d_count)
+    else:
+        dsts = [base_dst]
+
+    return srcs, dsts
+
+def multiplicity_from_heuristic(rule_text:str, base_src:str, base_dst:str, cap_src:int, cap_dst:int)->Tuple[List[str], List[str]]:
+    rt = (rule_text or "").lower()
+    if re.search(r'\b(ddos|syn[\s_-]*flood|flood)\b', rt):
+        return [random_public_ipv4() for _ in range(min(128, cap_src))], [base_dst]
+    if re.search(r'\b(scan|portscan|masscan|nmap|sweep)\b', rt):
+        return [base_src], expand_c_class(base_dst, min(32, cap_dst))
+    return [base_src], [base_dst]
 
 # =========================
 # Selection & naming
@@ -495,7 +558,8 @@ def pcap_name(group_id:str, sid:str, msg:str)->str:
 # =========================
 @dataclass
 class RunConfig:
-    rules_path: Path
+    rules_path: Optional[Path]
+    parsed_csv: Optional[Path]
     dst: str
     src: str
     out_dir: Path
@@ -503,34 +567,38 @@ class RunConfig:
     count: int
     easy_count: int
     use_llm: bool
-    random_src: int
-    dst_cclass: int
+    cap_src: int
+    cap_dst: int
+
+def load_rules(cfg: RunConfig) -> pd.DataFrame:
+    if cfg.parsed_csv:
+        LOG.info("Loading parsed CSV: %s", cfg.parsed_csv)
+        df = pd.read_csv(cfg.parsed_csv, dtype=str).fillna("")
+        required = {"sid","proto","msg","full_options","full_rule"}
+        missing = [c for c in required if c not in df.columns]
+        if missing:
+            raise ValueError(f"Parsed CSV missing columns: {missing}")
+        return df
+    elif cfg.rules_path:
+        LOG.info("Parsing rules file: %s", cfg.rules_path)
+        return parse_rules_file(cfg.rules_path)
+    else:
+        raise ValueError("Either --rules or --parsed must be provided.")
 
 def run(cfg: RunConfig):
     # load & group
-    df = parse_rules_file(cfg.rules_path)
+    df = load_rules(cfg)
     if df.empty:
-        LOG.error("No rules parsed from %s", cfg.rules_path)
+        LOG.error("No rules available.")
         return
     df = group_rules(df)
 
     # split & select
     easy_df, hard_df = split_difficulty(df)
-    LOG.info("Parsed %d rules. Easy=%d, Hard=%d", len(df), len(easy_df), len(hard_df))
+    LOG.info("Total=%d, Easy=%d, Hard=%d", len(df), len(easy_df), len(hard_df))
     target = select_mix(easy_df, hard_df, total=cfg.count, easy_n=cfg.easy_count)
     LOG.info("Selected %d rules (easy=%d, hard=%d)", len(target),
              sum(target.index.isin(easy_df.index)), sum(target.index.isin(hard_df.index)))
-
-    # endpoint sets
-    src_candidates = [cfg.src]
-    if cfg.random_src and cfg.random_src > 0:
-        src_candidates = [random_public_ipv4() for _ in range(cfg.random_src)]
-        LOG.info("Random public sources: %d", len(src_candidates))
-
-    dst_candidates = [cfg.dst]
-    if cfg.dst_cclass and cfg.dst_cclass > 0:
-        dst_candidates = expand_c_class(cfg.dst, cfg.dst_cclass)
-        LOG.info("Expanded /24 dests: %d", len(dst_candidates))
 
     # ensure out dir
     all_pkts=[]
@@ -546,6 +614,20 @@ def run(cfg: RunConfig):
         name_base = pcap_name(gid, sid, msg)
         is_easy = r.name in easy_df.index
 
+        # 1) decide instruction (hard->LLM else fallback; easy도 휴리스틱 multiplicity 적용)
+        instr = None
+        if is_easy:
+            instr = {"template_id": None, "params": {}, "multiplicity": None}  # placeholder
+        else:
+            instr = ask_llm_for_instruction(rule_text, r.get("group_signature",""), cfg.dst) if cfg.use_llm \
+                    else ask_llm_for_instruction(rule_text, r.get("group_signature",""), cfg.dst)
+
+        # 2) build endpoint sets (prefer LLM multiplicity; else heuristic)
+        if instr and instr.get("multiplicity"):
+            src_candidates, dst_candidates = multiplicity_from_instruction(instr, cfg.src, cfg.dst, cfg.cap_src, cfg.cap_dst)
+        else:
+            src_candidates, dst_candidates = multiplicity_from_heuristic(rule_text, cfg.src, cfg.dst, cfg.cap_src, cfg.cap_dst)
+
         for s in src_candidates:
             for d in dst_candidates:
                 ctx = {"src": s, "dst": d}
@@ -555,8 +637,7 @@ def run(cfg: RunConfig):
                         tmpl, params = easy_template(r.to_dict())
                         pkts = render_easy(ctx, tmpl, params)
                     else:
-                        inst = ask_llm_for_instruction(rule_text, r.get("group_signature",""))
-                        pkts = render_from_instruction(ctx, inst)
+                        pkts = render_from_instruction(ctx, instr)
 
                     if cfg.single_pcap:
                         all_pkts.extend(pkts)
@@ -573,21 +654,24 @@ def run(cfg: RunConfig):
         LOG.info("Wrote combined PCAP: %s (packets=%d)", outp, len(all_pkts))
 
 def main():
-    ap = argparse.ArgumentParser(description="Mix ~50 rules (easy+LLM) and generate realistic PCAPs")
-    ap.add_argument("--rules", required=True, help="Path to suricata.rules")
-    ap.add_argument("--dst", required=True, help="Destination/server IP (sensor)")
-    ap.add_argument("--src", default="192.168.56.10", help="Source/client IP [default: 192.168.56.10]")
+    ap = argparse.ArgumentParser(description="Suricata rules pilot PCAP generator (groups + 50 mix, with per-rule multiplicity)")
+    src_rules = ap.add_mutually_exclusive_group(required=True)
+    src_rules.add_argument("--rules", help="Path to suricata.rules (raw). If provided, program will parse it.")
+    src_rules.add_argument("--parsed", help="Path to parsed Suricata CSV (suricata_rules_parsed.csv). If provided, parsing is skipped.")
+    ap.add_argument("--dst", required=True, help="Destination/server IP (sensor) e.g., 192.0.2.10")
+    ap.add_argument("--src", default="192.168.56.10", help="Source/client base IP [default: 192.168.56.10]")
     ap.add_argument("--out", default="outputs/pcaps", help="Per-rule PCAP directory (disabled if --single-pcap)")
     ap.add_argument("--single-pcap", default=None, help="Write all flows into one PCAP (e.g., outputs/all_50.pcap)")
     ap.add_argument("--count", type=int, default=50, help="How many rules to test [default: 50]")
     ap.add_argument("--easy-count", type=int, default=30, help="How many from easy set [default: 30]")
-    ap.add_argument("--use-llm", action="store_true", help="If set, try GPT-5; otherwise local fallback instruction")
-    ap.add_argument("--random-src", type=int, default=0, help="Generate N random *public* source IPs (for DDoS-like multi-source)")
-    ap.add_argument("--dst-cclass", type=int, default=0, help="Generate N destination IPs within /24 of --dst (include --dst)")
+    ap.add_argument("--use-llm", action="store_true", help="If set, try GPT-5 for hard rules; otherwise heuristic")
+    ap.add_argument("--cap-src", type=int, default=256, help="Upper cap for source multiplicity decided by instruction/heuristic [default: 256]")
+    ap.add_argument("--cap-dst", type=int, default=64, help="Upper cap for destination multiplicity decided by instruction/heuristic [default: 64]")
     args = ap.parse_args()
 
     run(RunConfig(
-        rules_path=Path(args.rules),
+        rules_path=Path(args.rules) if args.rules else None,
+        parsed_csv=Path(args.parsed) if args.parsed else None,
         dst=args.dst,
         src=args.src,
         out_dir=Path(args.out),
@@ -595,19 +679,9 @@ def main():
         count=args.count,
         easy_count=args.easy_count,
         use_llm=bool(args.use_llm),
-        random_src=int(args.random_src),
-        dst_cclass=int(args.dst_cclass),
+        cap_src=int(args.cap_src),
+        cap_dst=int(args.cap_dst),
     ))
 
 if __name__ == "__main__":
     main()
-
-# 빠른 사용 예
-# 기본 50개 (쉬움 30 + 어려움 20), per-rule PCAP
-#python mixed_50_rule_pcapgen.py --rules suricata.rules --dst 192.168.100.80 --src 192.168.100.2 --out outputs/pcaps
-
-# GPT-5 사용 (환경변수 OPENAI_API_KEY 필요)
-#python mixed_50_rule_pcapgen.py --rules suricata.rules --dst 192.168.100.80 --src 192.168.100.2 --use-llm
-
-# DDoS 느낌: 랜덤 공인 소스 200개 × 목적지 /24 30개 → 한 파일로 합치기
-#python mixed_50_rule_pcapgen.py --rules suricata.rules --dst 203.0.113.10 --random-src 200 --dst-cclass 30 --single-pcap outputs/all_50_varied.pcap
