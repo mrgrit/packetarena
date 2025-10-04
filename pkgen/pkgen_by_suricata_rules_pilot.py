@@ -3,24 +3,15 @@
 """
 pkgen_by_suricata_rules_pilot.py
 (mini→autofix→mini-재시도→fallback 승격 + 입력축약 + LLM 캐시 + 설명/계획 로그)
-
-- (--parsed CSV) 있으면 파싱 생략, 아니면 (--rules)에서 Suricata 룰 파싱
-- 룰 그룹핑 → 쉬움/어려움 분리 → N개 선택
-- 쉬운 룰: 리얼 플로우(3-way/정상 종료, DNS Q/R, TLS ClientHello, SYN scan)
-- 어려운 룰: --use-llm 시 축약 입력으로 질의 → JSON 지시문 수신
-  * 검증 전 자동보정(autofix) → 실패 사유가 fixable이면 mini로 1회 재시도
-  * 그래도 실패하면 상위 모델(fallback)로 승격
-  * 최종 실패는 휴리스틱
-- LLM 캐시: group_id+compact 입력 키로 저장/재사용(./cache/llm_cache.db)
-- QnA(+파싱 JSON/검증결과/보정내역)는 ./log/llm/<sid>.qna
-- multiplicity: LLM 또는 휴리스틱(DDOS=랜덤 공인 SRC, 스캔=/24 DST fan-out)
-- 상한: --cap-src 256, --cap-dst 64
-- PCAP 이름: "<sid>__<msg_slug>__SRC_<src>__DST_<dst>__<group_id>.pcap"
++ 파일명: __by_<model>__v<rev>__L<length>
++ cache hit 여도 현재 SID 기준 .qna 로그 생성
++ --max-pkts 로 패킷 수 상한(0=무제한)
++ .qna에 PACKET_COUNT, FILE, RULE_REV/GID, LLM_STATUS 기록
 
 python3 pkgen_by_suricata_rules_pilot.py \
   --parsed suricata_rules_parsed.csv \
   --dst 192.168.100.80 --src 111.111.111.111 \
-  --use-llm --count 50 --out outputs/pcaps
+  --use-llm --count 50 --out outputs/pcaps --max-pkts 0
 
 필수: pip install -U scapy pandas openai
 환경: OPENAI_API_KEY, (선택) OPENAI_MODEL_PRIMARY=gpt-5-mini, OPENAI_MODEL_FALLBACK=gpt-5
@@ -288,14 +279,37 @@ def ensure_dirs():
     Path("./log/llm").mkdir(parents=True, exist_ok=True)
     Path("./cache").mkdir(parents=True, exist_ok=True)
 
-def write_qna_log(sid: str, prompt: str, model: str, output_text: str, parsed: Dict[str,Any] | None = None, valid: bool | None = None, notes: str = ""):
+def _qna_path(sid: str, model: str) -> Path:
+    return Path("./log/llm") / f"{sid}__by_{model}.qna"
+
+def write_qna_log(
+    sid: str,
+    prompt: str,
+    model: str,
+    output_text: str,
+    parsed: Dict[str,Any] | None = None,
+    valid: bool | None = None,
+    notes: str = "",
+    llm_status: str = "",
+    packet_count: int = 0,
+    file_name: str = "",
+    rule_rev: str = "",
+    rule_gid: str = ""
+):
     try:
         ensure_dirs()
-        p = Path("./log/llm") / f"{sid}.qna"
+        p = _qna_path(sid, model)
         with p.open("w", encoding="utf-8") as f:
-            f.write(f"MODEL: {model}\nTIME: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"VALID: {valid}\nNOTES: {notes}\n")
-            f.write("=== PROMPT ===\n"); f.write(prompt)
+            f.write(f"MODEL: {model}\n")
+            f.write(f"TIME: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"VALID: {valid}\n")
+            f.write(f"LLM_STATUS: {llm_status}\n")
+            f.write(f"NOTES: {notes}\n")
+            if rule_rev: f.write(f"RULE_REV: {rule_rev}\n")
+            if rule_gid: f.write(f"RULE_GID: {rule_gid}\n")
+            if packet_count: f.write(f"PACKET_COUNT: {packet_count}\n")
+            if file_name: f.write(f"FILE: {file_name}\n")
+            f.write("=== PROMPT ===\n"); f.write(prompt or "")
             f.write("\n\n=== RAW OUTPUT ===\n"); f.write(output_text or "")
             if parsed:
                 f.write("\n\n=== PARSED JSON ===\n"); f.write(json.dumps(parsed, ensure_ascii=False, indent=2))
@@ -308,6 +322,18 @@ def write_qna_log(sid: str, prompt: str, model: str, output_text: str, parsed: D
             f.write("\n")
     except Exception as e:
         LOG.warning("QnA log write failed for SID=%s: %s", sid, e)
+
+def append_qna_meta(sid: str, model: str, packet_count: int, file_name: str, rule_rev: str, rule_gid: str):
+    """생성 후 메타데이터(팩트)만 추가 기록"""
+    try:
+        p = _qna_path(sid, model)
+        with p.open("a", encoding="utf-8") as f:
+            if packet_count: f.write(f"\nPACKET_COUNT: {packet_count}\n")
+            if file_name: f.write(f"FILE: {file_name}\n")
+            if rule_rev: f.write(f"RULE_REV: {rule_rev}\n")
+            if rule_gid: f.write(f"RULE_GID: {rule_gid}\n")
+    except Exception as e:
+        LOG.warning("QnA meta append failed for SID=%s: %s", sid, e)
 
 class LLMCache:
     def __init__(self, db_path: Path = Path("./cache/llm_cache.db")):
@@ -346,10 +372,10 @@ def validate_instr(obj: Dict[str,Any]) -> Tuple[bool, str]:
     for k in ("template_id","params","attack_summary","packet_plan"):
         if k not in obj: return False, f"missing:{k}"
     if obj["template_id"] not in ALLOWED_TEMPLATES: return False, f"bad_template:{obj['template_id']}"
-    if len(str(obj["attack_summary"]))>160:
-        if not ALLOW_LENIENT: return False, "attack_summary_too_long"
-    if len(str(obj["packet_plan"]))>240:
-        if not ALLOW_LENIENT: return False, "packet_plan_too_long"
+    if len(str(obj["attack_summary"]))>160 and not ALLOW_LENIENT:
+        return False, "attack_summary_too_long"
+    if len(str(obj["packet_plan"]))>240 and not ALLOW_LENIENT:
+        return False, "packet_plan_too_long"
     t=obj["template_id"]; p=obj.get("params") or {}
     if t=="http_request" and "method" not in p: return False, "http_missing_method"
     if t=="dns_query" and "qname" not in p: return False, "dns_missing_qname"
@@ -444,7 +470,10 @@ def ask_llm_with_models(compact_json: str, base_dst: str, sid: str, group_id: st
     if not use_llm or not OPENAI_AVAILABLE:
         if use_llm and not OPENAI_IMPORT_OK: LOG.warning("--use-llm 이지만 openai SDK 불가")
         elif use_llm and not OPENAI_API_KEY_SET: LOG.warning("--use-llm 이지만 OPENAI_API_KEY 미설정")
-        return _fallback_instr_from_compact(compact_json)
+        obj = _fallback_instr_from_compact(compact_json)
+        obj["_model_name"] = "heuristic"
+        obj["_llm_status"] = "heuristic"
+        return obj
 
     from openai import OpenAI
     client = OpenAI()
@@ -452,7 +481,24 @@ def ask_llm_with_models(compact_json: str, base_dst: str, sid: str, group_id: st
     cached = cache.get(cache_key)
     if cached and cached.get("parsed"):
         LOG.info("LLM cache hit (group_id=%s)", group_id)
-        return cached["parsed"]
+        # cache hit이어도 현재 SID로 로그를 남긴다
+        try:
+            model = cached.get("model") or "(cache)"
+            prompt = cached.get("prompt")
+            output = cached.get("output") or "[CACHED] raw output not stored"
+            if not prompt:
+                sys_msg, usr_msg = build_prompt(compact_json, base_dst)
+                prompt = sys_msg + "\n\n" + usr_msg
+            write_qna_log(
+                sid, prompt, model, output,
+                parsed=cached["parsed"], valid=True, notes="cache_hit", llm_status="cache_hit"
+            )
+        except Exception as e:
+            LOG.warning("cache-hit 로그 기록 실패(SID=%s): %s", sid, e)
+        obj = dict(cached["parsed"])
+        obj["_model_name"] = cached.get("model") or "cache"
+        obj["_llm_status"] = "cache_hit"
+        return obj
 
     def call_model(model_name: str, force_template: Optional[str]=None):
         system_msg, user_msg = build_prompt(compact_json, base_dst)
@@ -468,14 +514,20 @@ def ask_llm_with_models(compact_json: str, base_dst: str, sid: str, group_id: st
         # 자동 보정 → 검증
         obj, fixes = autofix_instr(obj, compact_json)
         ok, reason = validate_instr(obj)
-        write_qna_log(sid, system_msg+"\n\n"+user_msg, model_name, txt, parsed=obj, valid=ok, notes=(reason + ((" | "+",".join(fixes)) if fixes else "")))
-        return obj, ok, reason, system_msg+"\n\n"+user_msg, txt
+        status = "fresh_primary_retry" if force_template else "fresh_primary"
+        write_qna_log(
+            sid, system_msg+"\n\n"+user_msg, model_name, txt,
+            parsed=obj, valid=ok, notes=(reason + ((" | "+",".join(fixes)) if fixes else "")),
+            llm_status=status
+        )
+        return obj, ok, reason, system_msg+"\n\n"+user_msg, txt, status
 
     # 1차: primary
     try:
-        obj, ok, reason, prmpt, raw = call_model(PRIMARY_MODEL)
+        obj, ok, reason, prmpt, raw, status = call_model(PRIMARY_MODEL)
         if ok:
-            cache.put(cache_key, PRIMARY_MODEL, prmpt, raw, obj)
+            obj["_model_name"] = PRIMARY_MODEL; obj["_llm_status"] = status
+            cache.put(sha1s(f"{group_id}|{compact_json}"), PRIMARY_MODEL, prmpt, raw, obj)
             return obj
         # fixable이면 mini로 재시도 (템플릿 고정)
         if reason in RETRY_FIXABLE:
@@ -485,9 +537,10 @@ def ask_llm_with_models(compact_json: str, base_dst: str, sid: str, group_id: st
                 "tls_missing_sni": "tls_clienthello",
                 "scan_missing_params": "syn_scan",
             }[reason]
-            obj, ok, reason, prmpt, raw = call_model(PRIMARY_MODEL, force_template=force)
+            obj, ok, reason, prmpt, raw, status = call_model(PRIMARY_MODEL, force_template=force)
             if ok:
-                cache.put(cache_key, PRIMARY_MODEL, prmpt, raw, obj)
+                obj["_model_name"] = PRIMARY_MODEL; obj["_llm_status"] = status
+                cache.put(sha1s(f"{group_id}|{compact_json}"), PRIMARY_MODEL, prmpt, raw, obj)
                 return obj
             LOG.warning("LLM(primary 재시도) 실패: %s → fallback", reason)
         else:
@@ -497,15 +550,30 @@ def ask_llm_with_models(compact_json: str, base_dst: str, sid: str, group_id: st
 
     # 2차: fallback
     try:
-        obj, ok, reason, prmpt, raw = call_model(FALLBACK_MODEL)
+        system_msg, user_msg = build_prompt(compact_json, base_dst)
+        resp = client.chat.completions.create(
+            model=FALLBACK_MODEL,
+            messages=[{"role":"system","content":system_msg},{"role":"user","content":user_msg}]
+        )
+        txt = resp.choices[0].message.content or ""
+        m = re.search(r"\{.*\}", txt, re.S)
+        obj = json.loads(m.group(0)) if m else json.loads(txt)
+        obj, fixes = autofix_instr(obj, compact_json)
+        ok, reason = validate_instr(obj)
+        write_qna_log(sid, system_msg+"\n\n"+user_msg, FALLBACK_MODEL, txt,
+                      parsed=obj, valid=ok, notes=(reason + ((" | "+",".join(fixes)) if fixes else "")),
+                      llm_status="fresh_fallback")
         if ok:
-            cache.put(cache_key, FALLBACK_MODEL, prmpt, raw, obj)
+            obj["_model_name"] = FALLBACK_MODEL; obj["_llm_status"]="fresh_fallback"
+            cache.put(sha1s(f"{group_id}|{compact_json}"), FALLBACK_MODEL, system_msg+"\n\n"+user_msg, txt, obj)
             return obj
         LOG.warning("LLM(fallback=%s) 검증실패: %s → 휴리스틱", FALLBACK_MODEL, reason)
     except Exception as e:
         LOG.warning("LLM(fallback=%s) 호출/파싱 예외: %s → 휴리스틱", FALLBACK_MODEL, e)
 
-    return _fallback_instr_from_compact(compact_json)
+    obj = _fallback_instr_from_compact(compact_json)
+    obj["_model_name"] = "heuristic"; obj["_llm_status"] = "heuristic"
+    return obj
 
 def _fallback_instr_from_compact(compact_json: str)->Dict[str,Any]:
     try:
@@ -595,13 +663,27 @@ def multiplicity_from_heuristic(msg_proto_opts:str, base_src:str, base_dst:str, 
     return [base_src], [base_dst]
 
 # ====================== selection & naming =========================
+def pcap_name(sid:str, msg:str, src:str, dst:str, group_id:str,
+              model_name:str="unknown", rev:str="", pkt_len:int=0)->str:
+    parts = [
+        sid or "NA",
+        slug(msg, 30),
+        f"SRC_{src.replace('.','-')}",
+        f"DST_{dst.replace('.','-')}",
+        group_id,
+        f"by_{model_name}",
+    ]
+    if rev:
+        parts.append(f"v{rev}")
+    if pkt_len:
+        parts.append(f"L{pkt_len}")
+    return "__".join(parts) + ".pcap"
+
 def select_mix(easy_df: pd.DataFrame, hard_df: pd.DataFrame, total:int=50, easy_n:int=30)->pd.DataFrame:
     easy_n=min(easy_n,total); hard_n=total-easy_n
     easy_pick = easy_df.sample(n=min(easy_n, len(easy_df)), random_state=42) if len(easy_df)>0 else easy_df.head(0)
     hard_pick = hard_df.sample(n=min(hard_n, len(hard_df)), random_state=1337) if len(hard_df)>0 else hard_df.head(0)
     return pd.concat([easy_pick, hard_pick], ignore_index=True)
-def pcap_name(sid:str, msg:str, src:str, dst:str, group_id:str)->str:
-    return f"{sid or 'NA'}__{slug(msg,30)}__SRC_{src.replace('.','-')}__DST_{dst.replace('.','-')}__{group_id}.pcap"
 
 # ============================== Runner =============================
 @dataclass
@@ -611,6 +693,7 @@ class RunConfig:
     out_dir: Path; single_pcap: Optional[Path]
     count: int; easy_count: int; use_llm: bool
     cap_src: int; cap_dst: int
+    max_pkts: int
 
 def load_rules(cfg: RunConfig) -> pd.DataFrame:
     if cfg.parsed_csv:
@@ -642,31 +725,55 @@ def run(cfg: RunConfig):
     for _, r in target.iterrows():
         sid=str(r.get("sid") or ""); msg=r.get("msg",""); gid=r.get("group_id","nogroup")
         rule_text=r.get("full_rule",""); is_easy = r.name in easy_df.index
+        rev=str(r.get("rev") or ""); gid_str=str(r.get("gid") or "")
 
         if is_easy:
-            instr={"multiplicity": None}
+            instr={"multiplicity": None, "_model_name":"easy", "_llm_status":"easy"}
         else:
             compact = compact_rule_for_llm(r.to_dict())
             instr = ask_llm_with_models(compact, cfg.dst, sid, gid, cache, cfg.use_llm)
 
+        # multiplicity
         if instr and instr.get("multiplicity"):
             src_candidates, dst_candidates = multiplicity_from_instruction(instr, cfg.src, cfg.dst, cfg.cap_src, cfg.cap_dst)
         else:
             src_candidates, dst_candidates = multiplicity_from_heuristic(rule_text, cfg.src, cfg.dst, cfg.cap_src, cfg.cap_dst)
 
+        model_name = instr.get("_model_name","unknown")
+        llm_status = instr.get("_llm_status","")
+
         for s in src_candidates:
             for d in dst_candidates:
-                ctx={"src":s,"dst":d}; name=pcap_name(sid, msg, s, d, gid)
+                ctx={"src":s,"dst":d}
+                # 생성
                 try:
                     if is_easy:
                         tmpl, params = easy_template(r.to_dict())
                         pkts = render_easy(ctx, tmpl, params)
                     else:
                         pkts = render_from_instruction(ctx, instr)
-                    if cfg.single_pcap: all_pkts.extend(pkts)
+                    # max_pkts 상한 적용
+                    if cfg.max_pkts and len(pkts) > cfg.max_pkts:
+                        LOG.warning("Truncated SID=%s to %d packets (was %d)", sid, cfg.max_pkts, len(pkts))
+                        pkts = pkts[:cfg.max_pkts]
+                    pkt_len = len(pkts)
+
+                    # 파일명 생성 (by_model, vrev, Llen 포함)
+                    name = pcap_name(sid, msg, s, d, gid, model_name, rev, pkt_len)
+
+                    if cfg.single_pcap:
+                        all_pkts.extend(pkts)
                     else:
-                        out = cfg.out_dir / name; wrpcap(str(out), pkts)
-                        LOG.info("Wrote %s (packets=%d)", out, len(pkts))
+                        out = cfg.out_dir / name
+                        wrpcap(str(out), pkts)
+                        LOG.info("Wrote %s (packets=%d)", out, pkt_len)
+
+                    # LLM 로그가 있는 경우 메타데이터 append
+                    if model_name not in ("easy",):
+                        # 파일 경로 (single_pcap일 때는 실제 파일명 모를 수 있으니 생략 가능)
+                        file_path_str = str(cfg.single_pcap if cfg.single_pcap else (cfg.out_dir / name))
+                        append_qna_meta(sid, model_name, pkt_len, file_path_str, rev, gid_str)
+
                 except Exception as e:
                     LOG.exception("Failed SID=%s (%s->%s): %s", sid, s, d, e)
 
@@ -688,6 +795,7 @@ def main():
     ap.add_argument("--use-llm", action="store_true", help="If set, ask LLM for hard rules (needs OPENAI_API_KEY)")
     ap.add_argument("--cap-src", type=int, default=256, help="Upper cap for source multiplicity [default: 256]")
     ap.add_argument("--cap-dst", type=int, default=64, help="Upper cap for destination multiplicity [default: 64]")
+    ap.add_argument("--max-pkts", type=int, default=0, help="Max packets per flow/file (0 = unlimited)")
     args = ap.parse_args()
 
     run(RunConfig(
@@ -698,6 +806,7 @@ def main():
         single_pcap=Path(args.single_pcap) if args.single_pcap else None,
         count=args.count, easy_count=args.easy_count,
         use_llm=bool(args.use_llm), cap_src=int(args.cap_src), cap_dst=int(args.cap_dst),
+        max_pkts=int(args.max_pkts),
     ))
 
 if __name__ == "__main__":
