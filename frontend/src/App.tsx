@@ -33,12 +33,13 @@ export default function App() {
   const replay = async () => {
     const p = prompt("pcap_path? (위 Generate 결과값 복사)");
     if (!p) return;
-    await axios.post(`${API}/replay/start`, {
+    const resp = await axios.post(`${API}/replay/start`, {
       pcap_path: p,
       iface,
       options: { mbps: "10M", loop: 1 },
     });
-    alert("replay started");
+    setLastReplayId(resp.data.replay_id);
+    alert(`replay started (id=${resp.data.replay_id})`);
   };
 
   const startSSE = () => {
@@ -82,6 +83,17 @@ export default function App() {
     alert(`Fetched: ${r.data.local_path}`);
   };
 
+  // (추가) 최근 N줄 인덱싱
+  const indexRemote = async () => {
+    const host = prompt("Sensor host?", remoteHost) || remoteHost;
+    const n = Number(prompt("tail -n ? (e.g. 10000)", "10000") || "10000");
+    const sudo = confirm("Use sudo to read eve.json?");
+    const r = await axios.post(`${API}/logs/index/remote`, null, { params: { host, n, sudo } });
+    alert(`Indexed: ${r.data.indexed}`);
+  };
+
+  const [lastReplayId, setLastReplayId] = useState<string>("");
+
   // ----- UI -----
   return (
     <div style={{ padding: 16 }}>
@@ -108,6 +120,19 @@ export default function App() {
       <button onClick={rewritePcap}>Rewrite PCAP</button>
       <button onClick={remoteCapture} style={{ marginLeft: 8 }}>
         Remote Capture
+      </button>
+
+      <h3>Index & Search</h3>
+      <button onClick={indexRemote}>Index Remote (tail)</button>
+      <button
+        onClick={async () => {
+          if (!lastReplayId) return alert("No replay run yet");
+          const r = await axios.get(`${API}/logs/search`, { params: { replay_id: lastReplayId, limit: 200 } });
+          setLogs(r.data.map((x:any)=>JSON.stringify(x)));
+        }}
+        style={{ marginLeft: 8 }}
+      >
+        Show Alerts for Last Replay
       </button>
 
       <h3>Suricata Live (Remote)</h3>

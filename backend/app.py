@@ -11,6 +11,10 @@ from routers.replay import router as replay_router
 from routers.logs import router as logs_router
 from routers.rewrite import router as rewrite_router
 from routers.capture import router as capture_router
+from routers.index_logs import router as index_router
+from routers.search_logs import router as search_router
+from models.suri_event import SuricataEvent
+from models.replay_session import ReplaySession
 
 Base.metadata.create_all(bind=engine)
 os.makedirs(settings.PCAP_DIR, exist_ok=True)
@@ -46,6 +50,8 @@ app.include_router(replay_router,  prefix="/api/v1")
 app.include_router(logs_router,    prefix="/api/v1")
 app.include_router(rewrite_router, prefix="/api/v1")
 app.include_router(capture_router, prefix="/api/v1")
+app.include_router(index_router,  prefix="/api/v1")
+app.include_router(search_router, prefix="/api/v1")
 
 @app.get("/api/v1/health")
 def health():
