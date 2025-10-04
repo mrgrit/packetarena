@@ -3,21 +3,17 @@
 """
 pkgen_by_suricata_rules_pilot.py
 
-- (--parsed CSV) 주면 파싱 생략, 아니면 (--rules)에서 Suricata 룰 파싱
-- 룰을 그룹핑(group_id)하고 쉬움/어려움 분리 → 약 50개 샘플 생성(튜닝 가능)
-- 쉬운 룰: 내장 리얼 플로우(3-way, 서버 응답, 정상 종료 / DNS Q/R / TLS ClientHello / SYN scan)
-- 어려운 룰: --use-llm 시 GPT에 질의하여 '지시문 JSON' 수신 → 엔진 렌더
-  * 질의/응답은 ./log/llm/<sid>.qna 로 기록
-  * SDK/키/네트워크 이슈 시 휴리스틱으로 대체
-- 공격 성격별 multiplicity(소스/목적지 다중화)를 LLM 또는 휴리스틱으로 결정
-  * SYN Flood/DDOS → random public src 다수(스푸핑 가정)
-  * Scan/Sweep → 대상 /24 대역 fan-out
+- (--parsed CSV)가 있으면 파싱 생략, 아니면 (--rules)에서 Suricata 룰 파싱
+- 룰 그룹핑(group_id) → 쉬움/어려움 분리 → ~50개 선택(튜닝 가능)
+- 쉬운 룰: 리얼 플로우(3-way, 서버 응답, 정상 종료 / DNS Q/R / TLS ClientHello / SYN scan)
+- 어려운 룰: --use-llm 시 GPT에 질의 → '지시문 JSON' 수신(공격 설명/패킷 계획/다중화 포함) → 렌더
+  * 모든 질의/응답(+파싱된 JSON 요약)은 ./log/llm/<sid>.qna로 저장
+  * SDK/키/네트워크 에러 시 휴리스틱 폴백(attack_summary/packet_plan 포함)
+- 공격 성격별 multiplicity(소스/목적지 다중화)는 LLM 또는 휴리스틱이 결정
+  * SYN Flood/DDOS → random public SRC 다수(스푸핑 가정)
+  * Scan/Sweep → DST /24 확장
 - 안전상한: --cap-src(기본 256), --cap-dst(기본 64)
 - PCAP 파일명: "<sid>__<msg_slug>__SRC_<src>__DST_<dst>__<group_id>.pcap"
-
-예시
-  python pkgen_by_suricata_rules_pilot.py --parsed suricata_rules_parsed.csv --dst 192.0.2.10 --src 192.168.56.10 --out outputs/pcaps
-  python pkgen_by_suricata_rules_pilot.py --rules suricata.rules --dst 192.0.2.10 --use-llm --single-pcap outputs/all_50.pcap
 """
 
 import argparse, os, re, json, random, time, hashlib, logging, ipaddress
@@ -31,7 +27,9 @@ from scapy.all import IP, TCP, UDP, Raw, DNS, DNSQR, DNSRR, wrpcap
 LOG = logging.getLogger("pkgen")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# -------------------- utils --------------------
+# ------------------------------------------------------------
+# misc utils
+# ------------------------------------------------------------
 def sha1s(s: str) -> str:
     return hashlib.sha1(s.encode()).hexdigest()
 
@@ -48,7 +46,9 @@ def stamp(pkts: List, t0: float, delta: float=0.02) -> List:
         t += delta
     return pkts
 
-# -------------------- parse rules --------------------
+# ------------------------------------------------------------
+# parse suricata.rules (only when --rules is used)
+# ------------------------------------------------------------
 RULE_RE = re.compile(
     r'^\s*(alert|drop|reject|pass|log)\s+[^\n]*?\([^\)]*\)\s*;?\s*$',
     re.IGNORECASE | re.MULTILINE,
@@ -146,7 +146,9 @@ def parse_rules_file(path: Path)->pd.DataFrame:
     df = pd.DataFrame(rows).fillna("")
     return df
 
-# -------------------- grouping --------------------
+# ------------------------------------------------------------
+# grouping
+# ------------------------------------------------------------
 ip_re = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 hex_re = re.compile(r"\b[0-9a-fA-F]{6,}\b")
 num_re = re.compile(r"\b\d+\b")
@@ -200,15 +202,11 @@ def group_rules(df: pd.DataFrame)->pd.DataFrame:
     df["group_signature"]=sig_strs
     return df
 
-# -------------------- difficulty split --------------------
-EASY_HINT_KEYS = {
-    "dns.query","http.host","http.uri","http.method","tls.sni",
-    "urilen","bsize","content"
-}
-HARD_HINT_KEYS = {
-    "pcre","byte_test","byte_extract","flowbits","distance","within",
-    "dsize","isdataat","base64_decode","file.data","filemagic","luajit"
-}
+# ------------------------------------------------------------
+# difficulty split
+# ------------------------------------------------------------
+EASY_HINT_KEYS = {"dns.query","http.host","http.uri","http.method","tls.sni","urilen","bsize","content"}
+HARD_HINT_KEYS = {"pcre","byte_test","byte_extract","flowbits","distance","within","dsize","isdataat","base64_decode","file.data","filemagic","luajit"}
 
 def split_difficulty(df: pd.DataFrame)->Tuple[pd.DataFrame,pd.DataFrame]:
     easy_idx=[]; hard_idx=[]
@@ -223,7 +221,9 @@ def split_difficulty(df: pd.DataFrame)->Tuple[pd.DataFrame,pd.DataFrame]:
             hard_idx.append(i)
     return df.loc[easy_idx].copy(), df.loc[hard_idx].copy()
 
-# -------------------- flow builders --------------------
+# ------------------------------------------------------------
+# realistic flow builders
+# ------------------------------------------------------------
 def tcp_3wh(src_ip:str, dst_ip:str, sport:int, dport:int, seq_c:int=None, seq_s:int=None)->List:
     seq_c = seq_c or random.randint(10_000_000, 20_000_000)
     seq_s = seq_s or random.randint(30_000_000, 40_000_000)
@@ -326,7 +326,9 @@ def render_easy(ctx:Dict[str,Any], tmpl:str, params:Dict[str,Any])->List:
         return flow_syn_scan(ctx, params.get("start",8000), params.get("cnt",20))
     return flow_http(ctx, "GET / HTTP/1.1\r\nHost: example.test\r\n\r\n")
 
-# -------------------- LLM (chat.completions) --------------------
+# ------------------------------------------------------------
+# LLM (chat.completions) + QnA logging
+# ------------------------------------------------------------
 OPENAI_API_KEY_SET = bool(os.getenv("OPENAI_API_KEY"))
 OPENAI_IMPORT_OK = True
 try:
@@ -334,11 +336,38 @@ try:
 except Exception as e:
     OPENAI_IMPORT_OK = False
     logging.warning("openai SDK import 실패: %s. `pip install --upgrade openai` 필요.", e)
-
 OPENAI_AVAILABLE = OPENAI_IMPORT_OK and OPENAI_API_KEY_SET
 LOG.info("LLM flags: OPENAI_IMPORT_OK=%s, OPENAI_API_KEY_SET=%s", OPENAI_IMPORT_OK, OPENAI_API_KEY_SET)
 
-def write_qna_log(sid: str, prompt: str, model: str, output_text: str):
+# instruction schema(논리적 가이드; 모델 프롬프트용)
+INSTR_SCHEMA = {
+  "type":"object",
+  "properties":{
+    "template_id":{"type":"string"},
+    "params":{"type":"object"},
+    "multiplicity":{
+        "type":"object",
+        "properties":{
+            "src":{"type":"object","properties":{
+                "strategy":{"type":"string"},
+                "count":{"type":"integer"},
+                "spoof":{"type":"boolean"}
+            }},
+            "dst":{"type":"object","properties":{
+                "strategy":{"type":"string"},
+                "count":{"type":"integer"}
+            }}
+        }
+    },
+    "filename_hint":{"type":"string"},
+    "attack_summary":{"type":"string"},   # 공격/룰 해석 요약
+    "packet_plan":{"type":"string"},      # 패킷 생성 계획 (단계별)
+    "rationale":{"type":"string"}
+  },
+  "required":["template_id","params","attack_summary","packet_plan"]
+}
+
+def write_qna_log(sid: str, prompt: str, model: str, output_text: str, parsed: Dict[str,Any] | None = None):
     try:
         outdir = Path("./log/llm")
         outdir.mkdir(parents=True, exist_ok=True)
@@ -348,8 +377,17 @@ def write_qna_log(sid: str, prompt: str, model: str, output_text: str):
             f.write(f"TIME: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
             f.write("=== PROMPT ===\n")
             f.write(prompt)
-            f.write("\n\n=== OUTPUT ===\n")
+            f.write("\n\n=== RAW OUTPUT ===\n")
             f.write(output_text)
+            if parsed:
+                f.write("\n\n=== PARSED JSON ===\n")
+                f.write(json.dumps(parsed, ensure_ascii=False, indent=2))
+                mult = parsed.get("multiplicity") or {}
+                f.write("\n\n=== SUMMARY ===\n")
+                f.write(f"attack_summary: {parsed.get('attack_summary','')}\n")
+                f.write(f"packet_plan: {parsed.get('packet_plan','')}\n")
+                f.write(f"multiplicity.src: {mult.get('src')}\n")
+                f.write(f"multiplicity.dst: {mult.get('dst')}\n")
             f.write("\n")
     except Exception as e:
         LOG.warning("QnA log write failed for SID=%s: %s", sid, e)
@@ -358,17 +396,28 @@ def _fallback_instr(rule_text: str) -> Dict[str,Any]:
     rt = (rule_text or "").lower()
     if re.search(r'\b(ddos|syn[\s_-]*flood|flood)\b', rt):
         mult = {"src":{"strategy":"random_public","count":128,"spoof":True}, "dst":{"strategy":"single","count":1}}
-    elif re.search(r'\b(scan|portscan|masscan|nmap|sweep)\b', rt):
+        attack_summary = "SYN Flood/DDOS 패턴으로 판단: 다수의 스푸핑된 공인 SRC를 사용."
+        packet_plan = "동일 DST/PORT로 짧은 간격의 TCP SYN만 연속 전송(서버 응답 필요 없음)."
+        return {"template_id":"syn_scan","params":{"start":80,"cnt":64},"multiplicity":mult,
+                "filename_hint":"ddos_syn_like","attack_summary":attack_summary,"packet_plan":packet_plan}
+    if re.search(r'\b(scan|portscan|masscan|nmap|sweep)\b', rt):
         mult = {"src":{"strategy":"single","count":1}, "dst":{"strategy":"c_class","count":32}}
-    else:
-        mult = {"src":{"strategy":"single","count":1}, "dst":{"strategy":"single","count":1}}
+        attack_summary = "포트/호스트 스캔 성격: /24 대역으로 DST fan-out."
+        packet_plan = "연속적인 TCP SYN 다중 포트/호스트로 송신(half-open SYN)."
+        return {"template_id":"syn_scan","params":{"start":8000,"cnt":20},"multiplicity":mult,
+                "filename_hint":"scan_like","attack_summary":attack_summary,"packet_plan":packet_plan}
+    mult = {"src":{"strategy":"single","count":1}, "dst":{"strategy":"single","count":1}}
     if "dns" in rt or "dns.query" in rt:
-        return {"template_id":"dns_query","params":{"qname":"hard.example.test","qtype":"A"},"multiplicity":mult,"filename_hint":"dns_like"}
+        return {"template_id":"dns_query","params":{"qname":"hard.example.test","qtype":"A"},"multiplicity":mult,
+                "filename_hint":"dns_like","attack_summary":"DNS 질의 기반 탐지","packet_plan":"Query/Response 페어 생성(id 일치, rd=1, qr=1)"}
     if "tls" in rt or "tls.sni" in rt:
-        return {"template_id":"tls_clienthello","params":{"sni":"hard.example.test"},"multiplicity":mult,"filename_hint":"tls_sni"}
+        return {"template_id":"tls_clienthello","params":{"sni":"hard.example.test"},"multiplicity":mult,
+                "filename_hint":"tls_sni","attack_summary":"TLS SNI 기반 탐지","packet_plan":"TCP 3WH 후 ClientHello(SNI) 송신, 정상 종료"}
     if "http" in rt or "host" in rt or "uri" in rt:
-        return {"template_id":"http_request","params":{"method":"GET","path":"/abc","headers":{"Host":"hard.example.test"},"body":""},"multiplicity":mult,"filename_hint":"http_get"}
-    return {"template_id":"http_request","params":{"method":"GET","path":"/","headers":{"Host":"hard.example.test"},"body":""},"multiplicity":mult,"filename_hint":"generic_http"}
+        return {"template_id":"http_request","params":{"method":"GET","path":"/abc","headers":{"Host":"hard.example.test"},"body":""},"multiplicity":mult,
+                "filename_hint":"http_get","attack_summary":"HTTP Host/URI/Content 매칭","packet_plan":"3WH→HTTP 요청→200 응답→FIN/ACK 종료"}
+    return {"template_id":"http_request","params":{"method":"GET","path":"/","headers":{"Host":"hard.example.test"},"body":""},"multiplicity":mult,
+            "filename_hint":"generic_http","attack_summary":"일반 HTTP 탐지 가정","packet_plan":"3WH→HTTP 요청→200 응답→FIN/ACK"}
 
 def ask_llm_for_instruction(rule_text:str, group_sig:str, base_dst:str, sid:str, use_llm:bool)->Dict[str,Any]:
     if not use_llm or not OPENAI_AVAILABLE:
@@ -382,16 +431,23 @@ def ask_llm_for_instruction(rule_text:str, group_sig:str, base_dst:str, sid:str,
     model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
     system_msg = (
-        "당신은 Suricata 룰 분석가입니다. 출력은 반드시 JSON만 반환하세요. "
+        "당신은 Suricata 룰 분석가이자 트래픽 생성 설계자입니다. "
+        "출력은 반드시 JSON만 반환하세요(추가 설명 금지). "
         "스키마: {template_id:str, params:obj, multiplicity:{src:{strategy,count,spoof}, dst:{strategy,count}}, "
-        "filename_hint?:str, rationale?:str}. 실제 익스플로잇 금지. 리얼 플로우 전제."
+        "filename_hint?:str, attack_summary:str, packet_plan:str, rationale?:str}. "
+        "실제 익스플로잇 금지. 리얼 플로우 전제."
     )
     user_msg = f"""
 목표: 룰을 트리거하는 '정밀 패킷 생성 지시문(JSON)'만 출력.
-- multiplicity 결정:
+반드시 attack_summary(공격/룰 해석)와 packet_plan(패킷 단계별 계획)을 포함.
+multiplicity 결정:
   - SYN Flood/DDOS: src.strategy="random_public", count 32~256, spoof=true
   - Port scan/sweep: dst.strategy="c_class", count 16~64 (/24 기준은 {base_dst})
   - 일반 단건: 모두 "single"
+리얼 플로우 기본:
+  - TCP: 3-way → 클라이언트 요청 → 서버 200 응답(혹은 적절) → FIN/ACK 종료
+  - TLS: ClientHello(SNI)
+  - DNS: Query/Response
 [입력 룰]
 {rule_text}
 
@@ -405,20 +461,18 @@ JSON만 출력하세요.
             messages=[
                 {"role":"system","content":system_msg},
                 {"role":"user","content":user_msg},
-            ]            
+            ]
         )
         txt = resp.choices[0].message.content or ""
-        write_qna_log(sid, system_msg + "\n\n" + user_msg, model_name, txt)
-
-        # JSON만 추출 (```json ... ``` 감싸온 경우 포함)
+        # JSON만 추출
         m = re.search(r"\{.*\}", txt, re.S)
-        if m:
-            return json.loads(m.group(0))
-        return json.loads(txt)
+        obj = json.loads(m.group(0)) if m else json.loads(txt)
+        write_qna_log(sid, system_msg + "\n\n" + user_msg, model_name, txt, parsed=obj)
+        return obj
     except Exception as e:
         LOG.warning("LLM 호출/파싱 실패(SID=%s): %s → 휴리스틱 사용", sid, e)
         try:
-            write_qna_log(sid, system_msg + "\n\n" + user_msg, model_name, f"[EXCEPTION] {e}")
+            write_qna_log(sid, system_msg + "\n\n" + user_msg, model_name, f"[EXCEPTION] {e}", parsed=None)
         except Exception:
             pass
         return _fallback_instr(rule_text)
@@ -450,7 +504,9 @@ def render_from_instruction(ctx:Dict[str,Any], instr:Dict[str,Any])->List:
         return flow_syn_scan(ctx, int(p.get("start",8000)), int(p.get("cnt",20)))
     return flow_http(ctx, "GET / HTTP/1.1\r\nHost: hard.example.test\r\n\r\n")
 
-# -------------------- multiplicity helpers --------------------
+# ------------------------------------------------------------
+# multiplicity helpers
+# ------------------------------------------------------------
 PRIVATE_NETS = [
     ipaddress.ip_network("10.0.0.0/8"),
     ipaddress.ip_network("172.16.0.0/12"),
@@ -460,12 +516,10 @@ PRIVATE_NETS = [
     ipaddress.ip_network("224.0.0.0/4"),
     ipaddress.ip_network("240.0.0.0/4"),
 ]
-
 def is_public_ipv4(ip: str) -> bool:
     try:
         ip4 = ipaddress.ip_address(ip)
-        if ip4.version != 4:
-            return False
+        if ip4.version != 4: return False
         for n in PRIVATE_NETS:
             if ip4 in n: return False
         return True
@@ -512,7 +566,6 @@ def multiplicity_from_instruction(instr: Dict[str,Any], base_src: str, base_dst:
         dsts = expand_c_class(base_dst, d_count)
     else:
         dsts = [base_dst]
-
     return srcs, dsts
 
 def multiplicity_from_heuristic(rule_text:str, base_src:str, base_dst:str, cap_src:int, cap_dst:int)->Tuple[List[str], List[str]]:
@@ -523,7 +576,9 @@ def multiplicity_from_heuristic(rule_text:str, base_src:str, base_dst:str, cap_s
         return [base_src], expand_c_class(base_dst, min(32, cap_dst))
     return [base_src], [base_dst]
 
-# -------------------- selection & naming --------------------
+# ------------------------------------------------------------
+# selection & naming
+# ------------------------------------------------------------
 def select_mix(easy_df: pd.DataFrame, hard_df: pd.DataFrame, total:int=50, easy_n:int=30)->pd.DataFrame:
     easy_n = min(easy_n, total)
     hard_n = total - easy_n
@@ -534,7 +589,9 @@ def select_mix(easy_df: pd.DataFrame, hard_df: pd.DataFrame, total:int=50, easy_
 def pcap_name(sid:str, msg:str, src:str, dst:str, group_id:str)->str:
     return f"{sid or 'NA'}__{slug(msg, 30)}__SRC_{src.replace('.','-')}__DST_{dst.replace('.','-')}__{group_id}.pcap"
 
-# -------------------- Runner --------------------
+# ------------------------------------------------------------
+# Runner
+# ------------------------------------------------------------
 @dataclass
 class RunConfig:
     rules_path: Optional[Path]
@@ -588,7 +645,7 @@ def run(cfg: RunConfig):
         rule_text = r.get("full_rule","")
         is_easy = r.name in easy_df.index
 
-        # instruction (hard rules → LLM/heuristic). easy도 multiplicity는 휴리스틱 사용
+        # instruction (hard→LLM/폴백). easy도 multiplicity는 휴리스틱 사용
         if is_easy:
             instr = {"multiplicity": None}
         else:
@@ -625,7 +682,7 @@ def run(cfg: RunConfig):
         LOG.info("Wrote combined PCAP: %s (packets=%d)", outp, len(all_pkts))
 
 def main():
-    ap = argparse.ArgumentParser(description="Suricata rules pilot PCAP generator (with per-rule multiplicity & LLM QnA logs)")
+    ap = argparse.ArgumentParser(description="Suricata rules pilot PCAP generator (LLM with attack_summary/packet_plan logs)")
     src_rules = ap.add_mutually_exclusive_group(required=True)
     src_rules.add_argument("--rules", help="Path to suricata.rules (raw). If provided, program will parse it.")
     src_rules.add_argument("--parsed", help="Path to parsed Suricata CSV (suricata_rules_parsed.csv). If provided, parsing is skipped.")
@@ -635,7 +692,7 @@ def main():
     ap.add_argument("--single-pcap", default=None, help="Write all flows into one PCAP (e.g., outputs/all_50.pcap)")
     ap.add_argument("--count", type=int, default=50, help="How many rules to test [default: 50]")
     ap.add_argument("--easy-count", type=int, default=30, help="How many from easy set [default: 30]")
-    ap.add_argument("--use-llm", action="store_true", help="If set, try GPT for hard rules (needs OPENAI_API_KEY)")
+    ap.add_argument("--use-llm", action="store_true", help="If set, ask GPT for hard rules (needs OPENAI_API_KEY)")
     ap.add_argument("--cap-src", type=int, default=256, help="Upper cap for source multiplicity [default: 256]")
     ap.add_argument("--cap-dst", type=int, default=64, help="Upper cap for destination multiplicity [default: 64]")
     args = ap.parse_args()
