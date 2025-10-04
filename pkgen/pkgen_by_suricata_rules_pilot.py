@@ -325,13 +325,17 @@ def render_easy(ctx:Dict[str,Any], tmpl:str, params:Dict[str,Any])->List:
     return flow_http(ctx, "GET / HTTP/1.1\r\nHost: example.test\r\n\r\n")
 
 # -------------------- LLM (with QnA logging) --------------------
-OPENAI_AVAILABLE = False
+# 교체 후
+OPENAI_AVAILABLE = bool(os.getenv("OPENAI_API_KEY"))
+OPENAI_IMPORT_OK = True
 try:
     from openai import OpenAI
-    if os.getenv("OPENAI_API_KEY"):
-        OPENAI_AVAILABLE = True
-except Exception:
+except Exception as e:
+    OPENAI_IMPORT_OK = False
+    # import 실패면 LLM은 비활성으로
     OPENAI_AVAILABLE = False
+    logging.warning("openai SDK import 실패: %s. `pip install openai` 필요.", e)
+
 
 INSTR_SCHEMA = {
   "type":"object",
@@ -394,6 +398,11 @@ def write_qna_log(sid: str, prompt: str, model: str, output_text: str):
         LOG.warning("QnA log write failed for SID=%s: %s", sid, e)
 
 def ask_llm_for_instruction(rule_text:str, group_sig:str, base_dst:str, sid:str, use_llm:bool)->Dict[str,Any]:
+    if use_llm and not OPENAI_IMPORT_OK:
+        LOG.warning("--use-llm 지정됨, 그러나 openai SDK 미설치/불러오기 실패. `pip install openai` 후 재시도합니다.")
+    elif use_llm and not os.getenv("OPENAI_API_KEY"):
+        LOG.warning("--use-llm 지정됨, 그러나 OPENAI_API_KEY 환경변수가 비어있습니다.")
+
     if use_llm and not OPENAI_AVAILABLE:
         LOG.warning("--use-llm 지정됨, 그러나 OPENAI_API_KEY 없음. 휴리스틱으로 대체합니다.")
     if use_llm and OPENAI_AVAILABLE:
