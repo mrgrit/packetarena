@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-pkgen_by_suricata_rules_pilot.py  (mini→검증→승격 + 입력축약 + LLM 캐시 + 설명/계획 로그)
+pkgen_by_suricata_rules_pilot.py
+(mini→autofix→mini-재시도→fallback 승격 + 입력축약 + LLM 캐시 + 설명/계획 로그)
 
 - (--parsed CSV) 있으면 파싱 생략, 아니면 (--rules)에서 Suricata 룰 파싱
-- 룰 그룹핑(group_id) → 쉬움/어려움 분리 → N개 선택
+- 룰 그룹핑 → 쉬움/어려움 분리 → N개 선택
 - 쉬운 룰: 리얼 플로우(3-way/정상 종료, DNS Q/R, TLS ClientHello, SYN scan)
-- 어려운 룰: --use-llm 시 LLM에 "축약 입력"으로 질의 → JSON 지시문 수신(attack_summary/packet_plan 포함)
-  * 스키마 검증 실패 시: (1) 캐시 무시하고 상위 모델로 재시도 → (2) 그래도 실패면 휴리스틱
-- LLM 캐시: group_id 기준으로 저장/재사용(./cache/llm_cache.db)
-- 모든 QnA(+파싱 JSON/검증결과)는 ./log/llm/<sid>.qna 로 기록
-- multiplicity: LLM 또는 휴리스틱이 결정(DDOS=랜덤 공인 SRC 다수, Scan=/24 DST fan-out)
-- 안전상한: --cap-src 256, --cap-dst 64
-- PCAP 파일명: "<sid>__<msg_slug>__SRC_<src>__DST_<dst>__<group_id>.pcap"
-
-export OPENAI_API_KEY=sk-...
-export OPENAI_MODEL_PRIMARY=gpt-5-mini
-export OPENAI_MODEL_FALLBACK=gpt-5
+- 어려운 룰: --use-llm 시 축약 입력으로 질의 → JSON 지시문 수신
+  * 검증 전 자동보정(autofix) → 실패 사유가 fixable이면 mini로 1회 재시도
+  * 그래도 실패하면 상위 모델(fallback)로 승격
+  * 최종 실패는 휴리스틱
+- LLM 캐시: group_id+compact 입력 키로 저장/재사용(./cache/llm_cache.db)
+- QnA(+파싱 JSON/검증결과/보정내역)는 ./log/llm/<sid>.qna
+- multiplicity: LLM 또는 휴리스틱(DDOS=랜덤 공인 SRC, 스캔=/24 DST fan-out)
+- 상한: --cap-src 256, --cap-dst 64
+- PCAP 이름: "<sid>__<msg_slug>__SRC_<src>__DST_<dst>__<group_id>.pcap"
 
 python3 pkgen_by_suricata_rules_pilot.py \
   --parsed suricata_rules_parsed.csv \
@@ -38,6 +37,10 @@ from scapy.all import IP, TCP, UDP, Raw, DNS, DNSQR, DNSRR, wrpcap
 LOG = logging.getLogger("pkgen")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
+# ------------ 글로벌 옵션 ------------
+ALLOW_LENIENT = True  # 길이 경고 등은 통과시키는 관용 모드
+RETRY_FIXABLE = {"dns_missing_qname","http_missing_method","tls_missing_sni","scan_missing_params"}
+
 # ============================== utils ==============================
 def sha1s(s: str) -> str:
     return hashlib.sha1(s.encode()).hexdigest()
@@ -45,7 +48,7 @@ def sha1s(s: str) -> str:
 def slug(s: str, n:int=40) -> str:
     s = (s or "").lower()
     s = re.sub(r'\s+', ' ', s).strip()
-    s = re.sub(r'[^a-z0-9._\-]+', '_', s)
+    s = re.sub(r'[^a-z0-9._\\-]+', '_', s)
     return (s[:n] or "nomsg")
 
 def stamp(pkts: List, t0: float, delta: float=0.02) -> List:
@@ -326,43 +329,13 @@ class LLMCache:
                                    (key, model, prompt, output, json.dumps(parsed or {}), time.time()))
         self.conn.commit()
 
-# instruction schema(프롬프트 가이드)
-INSTR_SCHEMA = {
-  "type":"object",
-  "properties":{
-    "template_id":{"type":"string"},
-    "params":{"type":"object"},
-    "multiplicity":{
-        "type":"object",
-        "properties":{
-            "src":{"type":"object","properties":{
-                "strategy":{"type":"string"},
-                "count":{"type":"integer"},
-                "spoof":{"type":"boolean"}
-            }},
-            "dst":{"type":"object","properties":{
-                "strategy":{"type":"string"},
-                "count":{"type":"integer"}
-            }}
-        }
-    },
-    "filename_hint":{"type":"string"},
-    "attack_summary":{"type":"string"},
-    "packet_plan":{"type":"string"},
-    "rationale":{"type":"string"}
-  },
-  "required":["template_id","params","attack_summary","packet_plan"]
-}
-
 ALLOWED_TEMPLATES = {"http_request","dns_query","tls_clienthello","syn_scan"}
 
 def compact_rule_for_llm(row: Dict[str,str]) -> str:
-    """룰 전체 대신 핵심 요약(토큰 절감)."""
+    """룰 전문 대신 핵심 요약(토큰 절감)."""
     msg=row.get("msg",""); proto=row.get("proto",""); ale=row.get("app-layer-event","")
     opts=row.get("full_options","")
-    # 핵심 옵션만 추림
     key_core, toks = extract_option_keys(opts)
-    # 상위 5 토큰만
     toks = toks[:5]
     return json.dumps({
         "msg": msg, "proto": proto, "app_layer_event": ale,
@@ -370,31 +343,43 @@ def compact_rule_for_llm(row: Dict[str,str]) -> str:
     }, ensure_ascii=False)
 
 def validate_instr(obj: Dict[str,Any]) -> Tuple[bool, str]:
-    # 필수
     for k in ("template_id","params","attack_summary","packet_plan"):
         if k not in obj: return False, f"missing:{k}"
     if obj["template_id"] not in ALLOWED_TEMPLATES: return False, f"bad_template:{obj['template_id']}"
-    # 길이 제한
-    if len(str(obj["attack_summary"]))>160: return False, "attack_summary_too_long"
-    if len(str(obj["packet_plan"]))>240: return False, "packet_plan_too_long"
-    # params 최소 점검
+    if len(str(obj["attack_summary"]))>160:
+        if not ALLOW_LENIENT: return False, "attack_summary_too_long"
+    if len(str(obj["packet_plan"]))>240:
+        if not ALLOW_LENIENT: return False, "packet_plan_too_long"
     t=obj["template_id"]; p=obj.get("params") or {}
     if t=="http_request" and "method" not in p: return False, "http_missing_method"
     if t=="dns_query" and "qname" not in p: return False, "dns_missing_qname"
     if t=="tls_clienthello" and "sni" not in p: return False, "tls_missing_sni"
     if t=="syn_scan" and ("start" not in p or "cnt" not in p): return False, "scan_missing_params"
-    # multiplicity 점검
     mult=obj.get("multiplicity") or {}
     for side in ("src","dst"):
         s=mult.get(side) or {}; cnt=int(s.get("count",1))
         if cnt<1: return False, f"mult_{side}_count_lt1"
     return True, "ok"
 
+def guess_template_hint(compact_json:str)->Optional[str]:
+    try:
+        j=json.loads(compact_json)
+        proto=(j.get("proto","") or "").lower()
+        toks=" ".join(j.get("option_tokens") or []).lower()
+        msg=(j.get("msg","") or "").lower()
+        if "dns" in proto or "dns.query" in toks: return "dns_query"
+        if "tls" in proto or "tls.sni" in toks:   return "tls_clienthello"
+        if "scan" in msg:                         return "syn_scan"
+        if "http" in proto or "http." in toks:    return "http_request"
+    except: pass
+    return None
+
 def build_prompt(compact_json:str, base_dst:str)->Tuple[str,str]:
+    tmpl_hint = guess_template_hint(compact_json)
+    hint = f"\n템플릿 힌트: template_id 후보는 '{tmpl_hint}'를 우선 고려." if tmpl_hint else ""
     system_msg = (
         "당신은 Suricata 룰 분석가이자 트래픽 생성 설계자입니다. "
-        "출력은 반드시 JSON만 반환하세요(설명 금지). "
-        "템플릿 후보는 {http_request,dns_query,tls_clienthello,syn_scan} 중 택1. "
+        "출력은 반드시 JSON만 반환(설명 금지). 템플릿 후보는 {http_request,dns_query,tls_clienthello,syn_scan} 중 택1. "
         "스키마: {template_id:str, params:obj, multiplicity:{src:{strategy,count,spoof}, dst:{strategy,count}}, "
         "filename_hint?:str, attack_summary:str(<=120자), packet_plan:str(<=200자), rationale?:str}. "
         "실제 익스플로잇 금지. 리얼 플로우 전제."
@@ -412,17 +397,56 @@ def build_prompt(compact_json:str, base_dst:str)->Tuple[str,str]:
   * DNS: Query/Response
 [룰 요약]
 {compact_json}
+{hint}
 JSON만 출력.
 """
     return system_msg, user_msg
 
-def ask_llm_with_models(compact_json: str, base_dst: str, sid: str, group_id: str, cache: LLMCache, use_llm: bool) -> Dict[str,Any]:
-    """mini → 검증 → 캐시에 저장. 실패 시 fallback 모델로 재시도. 최종 실패면 휴리스틱."""
+def autofix_instr(obj: Dict[str, Any], compact_json: str) -> Tuple[Dict[str,Any], List[str]]:
+    """누락 필드 자동 보정."""
+    fixes=[]
+    try:
+        cj = json.loads(compact_json)
+    except Exception:
+        cj = {}
+    t = obj.get("template_id","")
+    p = obj.setdefault("params", {}) or {}
+    if t == "dns_query":
+        if not p.get("qname"):
+            toks = " ".join(cj.get("option_tokens") or "")
+            m = re.search(r'(?:=|:)([a-z0-9.-]+\.(?:com|net|org|io|xyz|top|biz|info|be|is))', toks, re.I)
+            p["qname"] = (m.group(1) if m else "hard.example.test"); fixes.append("auto_fill:qname")
+        if not p.get("qtype"): p["qtype"]="A"; fixes.append("auto_fill:qtype")
+    elif t == "http_request":
+        if not p.get("method"): p["method"]="GET"; fixes.append("auto_fill:http.method")
+        hdr = p.setdefault("headers",{})
+        if not hdr.get("Host"):
+            toks = " ".join(cj.get("option_tokens") or "")
+            m = re.search(r'http\.host=([a-z0-9.-]+\.[a-z]{2,})', toks, re.I)
+            hdr["Host"] = (m.group(1) if m else "hard.example.test"); fixes.append("auto_fill:http.host")
+        if not p.get("path"): p["path"]="/"; fixes.append("auto_fill:http.path")
+        p.setdefault("body","")
+    elif t == "tls_clienthello":
+        if not p.get("sni"):
+            toks = " ".join(cj.get("option_tokens") or "")
+            m = re.search(r'tls\.sni=([a-z0-9.-]+\.[a-z]{2,})', toks, re.I)
+            p["sni"] = (m.group(1) if m else "hard.example.test"); fixes.append("auto_fill:tls.sni")
+    elif t == "syn_scan":
+        if "start" not in p: p["start"]=8000; fixes.append("auto_fill:syn.start")
+        if "cnt" not in p:   p["cnt"]=20;   fixes.append("auto_fill:syn.cnt")
+    obj.setdefault("multiplicity", {"src":{"strategy":"single","count":1}, "dst":{"strategy":"single","count":1}})
+    obj.setdefault("attack_summary","auto-filled summary")
+    obj.setdefault("packet_plan","auto-filled plan")
+    return obj, fixes
+
+def ask_llm_with_models(compact_json: str, base_dst: str, sid: str, group_id: str, cache: 'LLMCache', use_llm: bool) -> Dict[str,Any]:
+    """mini → (autofix 검증) → fixable 이슈면 mini 재시도 → 실패 시 fallback → 실패 시 휴리스틱"""
     if not use_llm or not OPENAI_AVAILABLE:
         if use_llm and not OPENAI_IMPORT_OK: LOG.warning("--use-llm 이지만 openai SDK 불가")
         elif use_llm and not OPENAI_API_KEY_SET: LOG.warning("--use-llm 이지만 OPENAI_API_KEY 미설정")
         return _fallback_instr_from_compact(compact_json)
 
+    from openai import OpenAI
     client = OpenAI()
     cache_key = sha1s(f"{group_id}|{compact_json}")
     cached = cache.get(cache_key)
@@ -430,8 +454,10 @@ def ask_llm_with_models(compact_json: str, base_dst: str, sid: str, group_id: st
         LOG.info("LLM cache hit (group_id=%s)", group_id)
         return cached["parsed"]
 
-    def call_model(model_name: str):
+    def call_model(model_name: str, force_template: Optional[str]=None):
         system_msg, user_msg = build_prompt(compact_json, base_dst)
+        if force_template:
+            user_msg += f"\n\n제약: template_id는 반드시 '{force_template}' 로 고정. 해당 템플릿에 필요한 params를 모두 채워라."
         resp = client.chat.completions.create(
             model=model_name,
             messages=[{"role":"system","content":system_msg},{"role":"user","content":user_msg}]
@@ -439,8 +465,10 @@ def ask_llm_with_models(compact_json: str, base_dst: str, sid: str, group_id: st
         txt = resp.choices[0].message.content or ""
         m = re.search(r"\{.*\}", txt, re.S)
         obj = json.loads(m.group(0)) if m else json.loads(txt)
+        # 자동 보정 → 검증
+        obj, fixes = autofix_instr(obj, compact_json)
         ok, reason = validate_instr(obj)
-        write_qna_log(sid, system_msg+"\n\n"+user_msg, model_name, txt, parsed=obj, valid=ok, notes=reason)
+        write_qna_log(sid, system_msg+"\n\n"+user_msg, model_name, txt, parsed=obj, valid=ok, notes=(reason + ((" | "+",".join(fixes)) if fixes else "")))
         return obj, ok, reason, system_msg+"\n\n"+user_msg, txt
 
     # 1차: primary
@@ -449,9 +477,23 @@ def ask_llm_with_models(compact_json: str, base_dst: str, sid: str, group_id: st
         if ok:
             cache.put(cache_key, PRIMARY_MODEL, prmpt, raw, obj)
             return obj
-        LOG.warning("LLM(primary=%s) 검증실패: %s → fallback 시도", PRIMARY_MODEL, reason)
+        # fixable이면 mini로 재시도 (템플릿 고정)
+        if reason in RETRY_FIXABLE:
+            force = {
+                "dns_missing_qname": "dns_query",
+                "http_missing_method": "http_request",
+                "tls_missing_sni": "tls_clienthello",
+                "scan_missing_params": "syn_scan",
+            }[reason]
+            obj, ok, reason, prmpt, raw = call_model(PRIMARY_MODEL, force_template=force)
+            if ok:
+                cache.put(cache_key, PRIMARY_MODEL, prmpt, raw, obj)
+                return obj
+            LOG.warning("LLM(primary 재시도) 실패: %s → fallback", reason)
+        else:
+            LOG.warning("LLM(primary) 검증실패: %s → fallback", reason)
     except Exception as e:
-        LOG.warning("LLM(primary=%s) 호출/파싱 예외: %s → fallback 시도", PRIMARY_MODEL, e)
+        LOG.warning("LLM(primary=%s) 호출/파싱 예외: %s → fallback", PRIMARY_MODEL, e)
 
     # 2차: fallback
     try:
@@ -463,22 +505,18 @@ def ask_llm_with_models(compact_json: str, base_dst: str, sid: str, group_id: st
     except Exception as e:
         LOG.warning("LLM(fallback=%s) 호출/파싱 예외: %s → 휴리스틱", FALLBACK_MODEL, e)
 
-    # 폴백
     return _fallback_instr_from_compact(compact_json)
 
 def _fallback_instr_from_compact(compact_json: str)->Dict[str,Any]:
     try:
         j = json.loads(compact_json)
     except Exception:
-        # 최소 폴백
         return {"template_id":"http_request","params":{"method":"GET","path":"/","headers":{"Host":"hard.example.test"},"body":""},
                 "multiplicity":{"src":{"strategy":"single","count":1},"dst":{"strategy":"single","count":1}},
                 "filename_hint":"generic_http","attack_summary":"HTTP 기반 탐지 가정","packet_plan":"3WH→HTTP 요청→200 응답→FIN/ACK"}
-
     msg = (j.get("msg") or "").lower()
     proto = (j.get("proto") or "").lower()
     toks = " ".join(j.get("option_tokens") or [])
-    # DDOS/SCAN 탐지
     if re.search(r'\b(ddos|syn[\s_-]*flood|flood)\b', msg+toks):
         return {"template_id":"syn_scan","params":{"start":80,"cnt":64},
                 "multiplicity":{"src":{"strategy":"random_public","count":128,"spoof":True},"dst":{"strategy":"single","count":1}},
@@ -487,7 +525,6 @@ def _fallback_instr_from_compact(compact_json: str)->Dict[str,Any]:
         return {"template_id":"syn_scan","params":{"start":8000,"cnt":20},
                 "multiplicity":{"src":{"strategy":"single","count":1},"dst":{"strategy":"c_class","count":32}},
                 "filename_hint":"scan_like","attack_summary":"스캔 패턴 추정","packet_plan":"다수 포트/호스트에 SYN 송신"}
-    # 프로토콜 분기
     if "dns" in proto or "dns.query" in toks:
         return {"template_id":"dns_query","params":{"qname":"hard.example.test","qtype":"A"},
                 "multiplicity":{"src":{"strategy":"single","count":1},"dst":{"strategy":"single","count":1}},
@@ -496,7 +533,6 @@ def _fallback_instr_from_compact(compact_json: str)->Dict[str,Any]:
         return {"template_id":"tls_clienthello","params":{"sni":"hard.example.test"},
                 "multiplicity":{"src":{"strategy":"single","count":1},"dst":{"strategy":"single","count":1}},
                 "filename_hint":"tls_sni","attack_summary":"TLS SNI 기반","packet_plan":"ClientHello(SNI)"}
-    # 기본 HTTP
     return {"template_id":"http_request","params":{"method":"GET","path":"/abc","headers":{"Host":"hard.example.test"},"body":""},
             "multiplicity":{"src":{"strategy":"single","count":1},"dst":{"strategy":"single","count":1}},
             "filename_hint":"http_get","attack_summary":"HTTP Host/URI/Content 매칭 가정","packet_plan":"3WH→HTTP 요청→200 응답→FIN/ACK"}
@@ -613,7 +649,6 @@ def run(cfg: RunConfig):
             compact = compact_rule_for_llm(r.to_dict())
             instr = ask_llm_with_models(compact, cfg.dst, sid, gid, cache, cfg.use_llm)
 
-        # multiplicity
         if instr and instr.get("multiplicity"):
             src_candidates, dst_candidates = multiplicity_from_instruction(instr, cfg.src, cfg.dst, cfg.cap_src, cfg.cap_dst)
         else:
@@ -640,7 +675,7 @@ def run(cfg: RunConfig):
         wrpcap(str(outp), all_pkts); LOG.info("Wrote combined PCAP: %s (packets=%d)", outp, len(all_pkts))
 
 def main():
-    ap = argparse.ArgumentParser(description="Suricata rules pilot PCAP generator (mini→검증→승격 + 캐시 + 축약입력)")
+    ap = argparse.ArgumentParser(description="Suricata rules pilot PCAP generator (mini→autofix→retry→fallback + 캐시 + 축약입력)")
     src_rules = ap.add_mutually_exclusive_group(required=True)
     src_rules.add_argument("--rules", help="Path to suricata.rules (raw). If provided, program will parse it.")
     src_rules.add_argument("--parsed", help="Path to parsed Suricata CSV (suricata_rules_parsed.csv). If provided, parsing is skipped.")
@@ -667,4 +702,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
